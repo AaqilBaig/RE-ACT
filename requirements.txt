@@ -1,0 +1,9 @@
+opencv-python
+numpy
+ultralytics
+transformers
+pillow
+python-dotenv
+requests
+torch
+torchvision

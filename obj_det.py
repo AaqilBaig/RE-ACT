@@ -1,27 +1,56 @@
 import cv2
 import numpy as np
-from ultralytics import FastSAM
-from transformers import pipeline
-from PIL import Image
+import torch
+from ultralytics import FastSAM, YOLO
 
-print(f"[Initialization] Loading OWLv2 and FastSAM globally... This may take a moment.")
-detector = pipeline(task="zero-shot-object-detection", model="google/owlv2-base-patch16")
+print(f"[Initialization] Loading YOLO-World and FastSAM globally... This may take a moment.")
+device_id = 0 if torch.cuda.is_available() else -1
+device_str = "cuda:0" if device_id == 0 else "cpu"
+print(f"[Initialization] Using device: {device_str}")
+
+# Load YOLOv8s-world model
+detector = YOLO("yolov8s-world.pt")
+
 fast_sam = FastSAM("FastSAM-s.pt")
+# NOTE: To enforce GPU for FastSAM on inference, use device=device_str in fast_sam() call later if needed.
 print(f"[Initialization] Models loaded successfully.")
 
-def locate_and_segment(target_class, camera_index=1):
+# Global camera instance to prevent startup latency on every grasp
+_global_cap = None
+_current_camera_index = None
+
+def get_camera(camera_index):
+    global _global_cap, _current_camera_index
+    if _global_cap is None or _current_camera_index != camera_index:
+        if _global_cap is not None:
+            _global_cap.release()
+        print(f"[Initialization] Opening camera {camera_index}...")
+        # Use DirectShow (CAP_DSHOW) backend on Windows to bypass slow auto-probing
+        _global_cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not _global_cap.isOpened():
+            # Fallback if DirectShow fails
+            _global_cap = cv2.VideoCapture(camera_index)
+            
+        _global_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        _global_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        _global_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        _current_camera_index = camera_index
+    return _global_cap
+
+def locate_and_segment(target_class, camera_index=0):
     """
-    Captures a frame from the camera, uses OWLv2 (a CLIP-based detector) to find the target_class,
+    Captures a frame from the camera, uses YOLO-World to find the target_class,
     and FastSAM to segment the object and find its centroid. Includes a live camera preview.
     """
-    # Capture frame (Removed cv2.CAP_DSHOW to fix Windows camera indexing)
-    cap = cv2.VideoCapture(camera_index)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap = get_camera(camera_index)
 
     if not cap.isOpened():
         print("Error: Could not open camera.")
         return None
 
+    # Set the target classes for YOLO-World
+    detector.set_classes([target_class])
+    
     print(f"Looking for '{target_class}' (Press 'q' in the window to abort)...")
     
     best_box = None
@@ -37,41 +66,42 @@ def locate_and_segment(target_class, camera_index=1):
             break
 
         frame_count += 1
-        
-        # Convert BGR OpenCV frame to RGB PIL image for transformers pipeline
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb_frame)
 
-        # 1. Detect bounding box with OWL-ViT
+        # 1. Detect bounding box with YOLO-World
         try:
-            results = detector(pil_img, candidate_labels=[target_class])
+            results = detector.predict(frame, conf=0.1, device=device_str, verbose=False)
         except Exception as e:
             print(f"Vision Inference Error: {e}")
             results = []
             
         annotated_frame = frame.copy()
         best_match = None
+        best_conf = 0.0
         
-        if results and len(results) > 0:
-            # Sort by highest score
-            best_match = max(results, key=lambda x: x['score'])
-            best_conf = best_match['score']
+        if results and len(results) > 0 and len(results[0].boxes) > 0:
+            # Sort boxes by highest confidence
+            boxes = results[0].boxes
+            conf_list = boxes.conf.cpu().numpy()
             
-            box = best_match['box']
-            # Format expected by FastSAM: [xmin, ymin, xmax, ymax]
-            best_box_tmp = [box['xmin'], box['ymin'], box['xmax'], box['ymax']]
+            best_idx = np.argmax(conf_list)
+            best_conf = conf_list[best_idx]
+            
+            # xmin, ymin, xmax, ymax
+            best_box_tensor = boxes.xyxy[best_idx]
+            best_box_tmp = best_box_tensor.cpu().numpy().tolist()
+            best_match = True
             
             # Draw the bounding box for live view
             cv2.rectangle(annotated_frame, 
-                          (int(box['xmin']), int(box['ymin'])), 
-                          (int(box['xmax']), int(box['ymax'])), 
+                          (int(best_box_tmp[0]), int(best_box_tmp[1])), 
+                          (int(best_box_tmp[2]), int(best_box_tmp[3])), 
                           (0, 255, 0), 2)
             cv2.putText(annotated_frame, f"{target_class}: {best_conf:.2f}",
-                        (int(box['xmin']), int(box['ymin']) - 10),
+                        (int(best_box_tmp[0]), int(best_box_tmp[1]) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         # Visualize the current frame
-        cv2.imshow("Robot Vision - CLIP Detector", annotated_frame)
+        cv2.imshow("Robot Vision - YOLO-World", annotated_frame)
 
         # Break if user presses 'q' manually
         key = cv2.waitKey(1) & 0xFF
@@ -84,8 +114,8 @@ def locate_and_segment(target_class, camera_index=1):
             if frame_count % 10 == 0:
                 print(f"[Vision Debug] Frame {frame_count}: Model sees '{target_class}' with confidence ({best_conf:.2f}).")
             
-            # Additional validation threshold for CLIP-based detection
-            if best_conf > 0.1:
+            # Lock in if confidence exceeds threshold (can increase this for YOLO)
+            if best_conf > 0.15:
                 print(f"[Vision Debug] Detection locked! Confidence: {best_conf:.2f}")
                 # Lock in this frame for SAM
                 final_frame = frame.copy()
@@ -93,13 +123,14 @@ def locate_and_segment(target_class, camera_index=1):
                 best_box = best_box_tmp
                 print(f"Found '{target_class}' bounding box: {best_box}")
                 
-                cv2.waitKey(500) # Briefly pause on the found frame
+                cv2.waitKey(1) # Briefly pump the event loop
                 break
             else:
                 if frame_count % 10 == 0:
                     print(f"[Vision Debug] Phantom object detected but confidence ({best_conf:.2f}) is too low to trigger lock...")
 
-    cap.release()
+    # We do NOT release the camera here so it stays open for the next call.
+    # cap.release() 
 
     if not best_box:
         print(f"'{target_class}' not found or aborted.")
@@ -107,7 +138,7 @@ def locate_and_segment(target_class, camera_index=1):
         return None
 
     # 2. Segment within the bounding box using FastSAM
-    sam_results = fast_sam(final_frame, bboxes=[best_box], verbose=False)
+    sam_results = fast_sam(final_frame, bboxes=[best_box], verbose=False, device=device_str)
     
     if not sam_results or sam_results[0].masks is None:
         print("Failed to generate a segmentation mask.")
@@ -134,8 +165,8 @@ def locate_and_segment(target_class, camera_index=1):
         cv2.putText(final_annotated_frame, f"Grasp: ({cX}, {cY})", (cX - 40, cY - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
-        cv2.imshow("Robot Vision - CLIP Detector", final_annotated_frame)
-        cv2.waitKey(1500) # Display the calculated grasp point for 1.5 seconds
+        cv2.imshow("Robot Vision - YOLO-World", final_annotated_frame)
+        cv2.waitKey(1) # Display the calculated grasp point
         cv2.destroyAllWindows()
         
         return (cX, cY)

@@ -1,7 +1,11 @@
 import requests
 import json
 import time
+import os
+from dotenv import load_dotenv
 from obj_det import locate_and_segment
+
+load_dotenv()
 
 def get_llm_plan(task_description):
     """
@@ -31,7 +35,7 @@ def get_llm_plan(task_description):
     response = requests.post(
       url="https://openrouter.ai/api/v1/chat/completions",
       headers={
-        "Authorization": "Bearer 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",
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
       },
       data=json.dumps({
         "model": "arcee-ai/trinity-large-preview:free",
