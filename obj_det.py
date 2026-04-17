@@ -75,6 +75,11 @@ def locate_and_segment(target_class, camera_index=0):
     best_conf = 0.0
     best_match = False
     stable_hits = 0
+    # Track motion between inference updates so box follows moving objects smoothly.
+    track_template = None
+    track_box = None
+    track_last_update = 0
+    track_miss_count = 0
 
     target_lower = target_class.lower()
     small_object_keywords = ("key", "coin", "tape", "pen", "screw", "bolt", "nut")
@@ -102,6 +107,7 @@ def locate_and_segment(target_class, camera_index=0):
 
     def run_inference(frame_copy, target):
         nonlocal best_box_tmp, best_conf, best_match, stable_hits
+        nonlocal track_template, track_box, track_last_update, track_miss_count
         try:
             # Keep aspect ratio to avoid shape distortions that can cause false positives
             infer_w, infer_h = 256, 192
@@ -166,8 +172,21 @@ def locate_and_segment(target_class, camera_index=0):
                         best_box_tmp = candidate_box
                         best_conf = candidate_conf
                         best_match = True
+                        track_box = candidate_box.copy()
+                        cx1, cy1, cx2, cy2 = [int(v) for v in candidate_box]
+                        cx1 = max(0, min(cx1, frame_w - 1))
+                        cy1 = max(0, min(cy1, frame_h - 1))
+                        cx2 = max(cx1 + 1, min(cx2, frame_w))
+                        cy2 = max(cy1 + 1, min(cy2, frame_h))
+                        gray_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
+                        roi = gray_full[cy1:cy2, cx1:cx2]
+                        if roi.size > 0:
+                            track_template = roi.copy()
+                            track_last_update = frame_count
+                            track_miss_count = 0
                     else:
-                        best_match = False
+                        if track_template is None:
+                            best_match = False
         except Exception as e:
             print(f"Vision Inference Error: {e}")
         finally:
@@ -187,6 +206,65 @@ def locate_and_segment(target_class, camera_index=0):
         if not inference_running[0]:
             inference_running[0] = True
             threading.Thread(target=run_inference, args=(frame.copy(), target_class), daemon=True).start()
+
+        # Fast motion tracking between OWL-v2 updates.
+        frame_h, frame_w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if best_match and best_box_tmp is not None:
+            x1, y1, x2, y2 = [int(v) for v in best_box_tmp]
+            x1 = max(0, min(x1, frame_w - 1))
+            y1 = max(0, min(y1, frame_h - 1))
+            x2 = max(x1 + 1, min(x2, frame_w))
+            y2 = max(y1 + 1, min(y2, frame_h))
+
+            # Rebuild template when detection updates or tracker is stale.
+            if track_box is None or box_iou(track_box, [x1, y1, x2, y2]) < 0.60:
+                roi = gray[y1:y2, x1:x2]
+                if roi.size > 0:
+                    track_template = roi.copy()
+                    track_box = [float(x1), float(y1), float(x2), float(y2)]
+                    track_last_update = frame_count
+
+        if track_template is not None and track_box is not None:
+            tx1, ty1, tx2, ty2 = [int(v) for v in track_box]
+            bw = max(1, tx2 - tx1)
+            bh = max(1, ty2 - ty1)
+            margin_x = max(12, int(bw * 0.75))
+            margin_y = max(12, int(bh * 0.75))
+
+            sx1 = max(0, tx1 - margin_x)
+            sy1 = max(0, ty1 - margin_y)
+            sx2 = min(frame_w, tx2 + margin_x)
+            sy2 = min(frame_h, ty2 + margin_y)
+
+            search = gray[sy1:sy2, sx1:sx2]
+            if search.shape[0] >= track_template.shape[0] and search.shape[1] >= track_template.shape[1]:
+                corr = cv2.matchTemplate(search, track_template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(corr)
+
+                # Accept only reasonable correlation to avoid drift.
+                if max_val >= 0.45:
+                    nx1 = sx1 + max_loc[0]
+                    ny1 = sy1 + max_loc[1]
+                    nx2 = nx1 + track_template.shape[1]
+                    ny2 = ny1 + track_template.shape[0]
+                    track_box = [float(nx1), float(ny1), float(nx2), float(ny2)]
+                    best_box_tmp = track_box.copy()
+                    track_last_update = frame_count
+                    best_match = True
+                    track_miss_count = 0
+
+                    # Refresh template occasionally for robustness against lighting/pose change.
+                    if frame_count % 8 == 0:
+                        new_roi = gray[ny1:ny2, nx1:nx2]
+                        if new_roi.shape == track_template.shape and new_roi.size > 0:
+                            track_template = new_roi.copy()
+                else:
+                    track_miss_count += 1
+                    if track_miss_count > 10:
+                        track_template = None
+                        track_box = None
+                        best_match = False
 
         # Draw the bounding box for live view using the most recently known detection
         if best_match and best_box_tmp is not None:
