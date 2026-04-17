@@ -10,6 +10,9 @@ print(f"[Initialization] Loading OWL-v2 and FastSAM globally... This may take a 
 device_id = 0 if torch.cuda.is_available() else -1
 device_str = "cuda:0" if device_id == 0 else "cpu"
 
+if device_id == 0:
+    torch.backends.cudnn.benchmark = True
+
 # Enable CPU multithreading optimizations explicitly if no GPU is found
 if device_str == "cpu":
     torch.set_num_threads(4) # Limit PyTorch to 4 threads to prevent it from chocking the OS and locking the CPU cache 
@@ -19,6 +22,7 @@ print(f"[Initialization] Using device: {device_str}")
 processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
 
 detector = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble").to(device_str)
+detector.eval()
 
 fast_sam = FastSAM("FastSAM-s.pt")
 # NOTE: To enforce GPU for FastSAM on inference, use device=device_str in fast_sam() call later if needed.
@@ -75,8 +79,9 @@ def locate_and_segment(target_class, camera_index=0):
     target_lower = target_class.lower()
     small_object_keywords = ("key", "coin", "tape", "pen", "screw", "bolt", "nut")
     is_small_object = any(k in target_lower for k in small_object_keywords)
-    detection_threshold = 0.22 if is_small_object else 0.16
-    lock_threshold = 0.30 if is_small_object else 0.20
+    detection_threshold = 0.18 if is_small_object else 0.14
+    lock_threshold = 0.24 if is_small_object else 0.18
+    min_stable_hits = 0 if is_small_object else 1
 
     def box_iou(a, b):
         ax1, ay1, ax2, ay2 = a
@@ -99,14 +104,21 @@ def locate_and_segment(target_class, camera_index=0):
         nonlocal best_box_tmp, best_conf, best_match, stable_hits
         try:
             # Keep aspect ratio to avoid shape distortions that can cause false positives
-            small_frame = cv2.resize(frame_copy, (320, 240))
+            infer_w, infer_h = 256, 192
+            small_frame = cv2.resize(frame_copy, (infer_w, infer_h))
             image = Image.fromarray(cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB))
             texts = [[f"a photo of a {target}"]]
             inputs = processor(text=texts, images=image, return_tensors="pt").to(device_str)
+            if device_id == 0:
+                inputs["pixel_values"] = inputs["pixel_values"].half()
             
             # Use inference_mode to accelerate the PyTorch model computationally 
             with torch.inference_mode():
-                outputs = detector(**inputs)
+                if device_id == 0:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        outputs = detector(**inputs)
+                else:
+                    outputs = detector(**inputs)
                 
             target_sizes = torch.tensor([image.size[::-1]]).to(device_str)
             results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=detection_threshold)
@@ -129,8 +141,8 @@ def locate_and_segment(target_class, camera_index=0):
                         conf = scores[idx].item()
                         raw_box = boxes[idx].cpu().numpy().tolist()
 
-                        scale_x = frame_w / 320
-                        scale_y = frame_h / 240
+                        scale_x = frame_w / infer_w
+                        scale_y = frame_h / infer_h
                         box = [raw_box[0] * scale_x, raw_box[1] * scale_y, raw_box[2] * scale_x, raw_box[3] * scale_y]
 
                         bw = max(1.0, box[2] - box[0])
@@ -201,7 +213,7 @@ def locate_and_segment(target_class, camera_index=0):
                 print(f"[Vision Debug] Frame {frame_count}: Model sees '{target_class}' with confidence ({best_conf:.2f}).")
             
             # Lock in if confidence exceeds threshold (can increase this for YOLO)
-            if best_conf > lock_threshold and stable_hits >= 1:
+            if best_conf > lock_threshold and stable_hits >= min_stable_hits:
                 print(f"[Vision Debug] Detection locked! Confidence: {best_conf:.2f}")
                 # Lock in this frame for SAM
                 final_frame = frame.copy()
