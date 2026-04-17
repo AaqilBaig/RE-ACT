@@ -2,10 +2,36 @@ import requests
 import json
 import time
 import os
+import speech_recognition as sr
 from dotenv import load_dotenv
 from obj_det import locate_and_segment
 
 load_dotenv()
+
+def get_voice_command():
+    """
+    Uses the system microphone to capture a voice command and translates it to text.
+    """
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("\n[Microphone] Adjusting for ambient noise... Please wait.")
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+        print("\n[Microphone] Recording for 5 seconds... Speak now!")
+        try:
+            # Force record for exactly 5 seconds (bypasses silence-detection bugs where it hangs)
+            audio = recognizer.record(source, duration=5)
+            print("[Microphone] Processing speech...")
+            # Use Google's free Web Speech API (no API key required)
+            text = recognizer.recognize_google(audio)
+            print(f"[Voice Input] You said: '{text}'")
+            return text
+        except sr.WaitTimeoutError:
+            print("[Microphone] Error: Listening timed out while waiting for phrase to start.")
+        except sr.UnknownValueError:
+            print("[Microphone] Error: Could not understand audio. Please speak clearly.")
+        except sr.RequestError as e:
+            print(f"[Microphone] Error: Could not request results; {e}")
+    return None
 
 def get_llm_plan(task_description):
     """
@@ -14,7 +40,7 @@ def get_llm_plan(task_description):
     prompt_text = f"""
     Convert the following user task into a structured JSON array of robotic actions.
     Allowed actions: 
-    - "grasp" (requires "target" string, which is the physical object name)
+    - "grasp" (requires "target" string, which is the physical object name. INCLUDE adjectives like colors or materials if mentioned, e.g., "green tape" or "metallic cup")
     - "move" (requires "target" string, which can be a direction or destination location)
     - "drop" (requires "location" string)
     
@@ -36,6 +62,7 @@ def get_llm_plan(task_description):
       url="https://openrouter.ai/api/v1/chat/completions",
       headers={
         "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json"
       },
       data=json.dumps({
         "model": "arcee-ai/trinity-large-preview:free",
@@ -111,11 +138,19 @@ def execute_plan(plan):
 def main():
     print("=== Robot Task Orchestrator Initialized ===")
     
-    # 1. Take objective from user
-    task_description = input("Enter the task for the robot (e.g., 'put the blue block in the left bin'): ")
-    if not task_description.strip():
-        print("No task entered. Exiting.")
-        return
+    # 1. Prompt user whether they want to use microphone or typing
+    use_voice_input = input("Would you like to use voice commands? (y/n): ").strip().lower()
+    
+    if use_voice_input == 'y':
+        task_description = get_voice_command()
+        if not task_description:
+            return  # Exit if no command was picked up
+    else:
+        # Text input fallback
+        task_description = input("Enter the task for the robot (e.g., 'pick the green tape only'): ")
+        if not task_description.strip():
+            print("No task entered. Exiting.")
+            return
     
     # 2. Chain-of-Thought / LLM Planning
     plan = get_llm_plan(task_description)
