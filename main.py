@@ -79,19 +79,10 @@ def get_llm_plan(task_description):
     """
     prompt_text = f"""
     Convert the following user task into a structured JSON array of robotic actions.
-    Allowed actions:
-    - "grasp" (requires "target" string)
-    - "move" (requires "target" string, destination/location)
+    Allowed actions: 
+    - "grasp" (requires "target" string, which is the physical object name. INCLUDE adjectives like colors or materials if mentioned, e.g., "green tape" or "metallic cup")
+    - "move" (requires "target" string, which can be a direction or destination location)
     - "drop" (requires "location" string)
-    - "wait" (optional "seconds" number, default 1)
-    - "verify" (requires "target" string, optional "strict" boolean)
-    - "repeat" (requires "count" integer and "steps" array of actions)
-
-    Rules:
-    - Decompose complex instructions into many small ordered steps.
-    - Preserve object descriptors (color/material/size), e.g., "green tape".
-    - If user mentions multiple objects or destinations, create separate sequences for each.
-    - Output ONLY JSON, no markdown or explanations.
     
     User task: "{task_description}"
     
@@ -126,14 +117,6 @@ def get_llm_plan(task_description):
 
     try:
         data = response.json()
-        if response.status_code != 200:
-            print(f"Error from API (HTTP {response.status_code}): {data}")
-            return []
-
-        if "choices" not in data or not data["choices"]:
-            print(f"Error from API: {data}")
-            return []
-
         message = data['choices'][0]['message']['content'].strip()
         
         # Clean up the message if returned with markdown code blocks
@@ -142,7 +125,7 @@ def get_llm_plan(task_description):
         elif "```" in message:
             message = message.split("```")[1].strip()
             
-        plan = normalize_and_expand_plan(json.loads(message))
+        plan = json.loads(message)
         print("\n[LLM Response] Plan generated successfully:")
         print(json.dumps(plan, indent=2))
         return plan
@@ -155,99 +138,10 @@ def get_llm_plan(task_description):
         print(f"Error connecting to LLM: {e}")
         return []
 
-
-def normalize_and_expand_plan(plan_raw):
-    """
-    Normalizes LLM plan output and expands repeat steps for deterministic execution.
-    """
-    if isinstance(plan_raw, dict):
-        plan_raw = plan_raw.get("plan", [])
-
-    if not isinstance(plan_raw, list):
-        return []
-
-    action_alias = {
-        "pick": "grasp",
-        "grab": "grasp",
-        "pickup": "grasp",
-        "pick_up": "grasp",
-        "go": "move",
-        "navigate": "move",
-        "place": "drop",
-        "release": "drop",
-        "put": "drop",
-        "putdown": "drop",
-        "put_down": "drop",
-        "pause": "wait",
-        "sleep": "wait",
-        "check": "verify",
-        "confirm": "verify",
-        "inspect": "verify",
-        "look_for": "verify",
-    }
-
-    normalized = []
-    for step in plan_raw:
-        if not isinstance(step, dict):
-            continue
-
-        raw_action = str(step.get("action", "")).strip().lower()
-        action = action_alias.get(raw_action, raw_action)
-
-        if action == "repeat":
-            count = step.get("count", 1)
-            try:
-                count = max(1, int(count))
-            except Exception:
-                count = 1
-
-            nested_steps = normalize_and_expand_plan(step.get("steps", []))
-            for _ in range(count):
-                normalized.extend(nested_steps)
-            continue
-
-        if action == "grasp":
-            target = step.get("target")
-            if isinstance(target, str) and target.strip():
-                normalized.append({"action": "grasp", "target": target.strip()})
-
-        elif action == "move":
-            target = step.get("target") or step.get("location")
-            if isinstance(target, str) and target.strip():
-                normalized.append({"action": "move", "target": target.strip()})
-
-        elif action == "drop":
-            location = step.get("location") or step.get("target")
-            if isinstance(location, str) and location.strip():
-                normalized.append({"action": "drop", "location": location.strip()})
-
-        elif action == "wait":
-            seconds = step.get("seconds", 1)
-            try:
-                seconds = max(0.2, min(30.0, float(seconds)))
-            except Exception:
-                seconds = 1.0
-            normalized.append({"action": "wait", "seconds": seconds})
-
-        elif action == "verify":
-            target = step.get("target")
-            if isinstance(target, str) and target.strip():
-                normalized.append(
-                    {
-                        "action": "verify",
-                        "target": target.strip(),
-                        "strict": bool(step.get("strict", False)),
-                    }
-                )
-
-    return normalized
-
 def execute_plan(plan):
     """
     Loops over the structured actions and executes them.
     """
-    held_object = None
-
     for step_index, step in enumerate(plan):
         action = step.get("action")
         target = step.get("target") or step.get("location")
@@ -263,7 +157,6 @@ def execute_plan(plan):
                 print(f"[Robot Hardware] Moving arm to coordinates: X:{coords[0]}, Y:{coords[1]}")
                 time.sleep(1)
                 print(f"[Robot Hardware] Closing gripper. '{target}' grasped successfully.")
-                held_object = target
             else:
                 print(f"[Robot Hardware Error] Could not find '{target}'. Aborting sequence.")
                 break
@@ -276,32 +169,11 @@ def execute_plan(plan):
         elif action == "drop":
             print(f"[Robot Hardware] Opening gripper. Dropping payload into '{target}'.")
             time.sleep(0.5)
-            held_object = None
-
-        elif action == "wait":
-            seconds = step.get("seconds", 1)
-            print(f"[Robot Hardware] Waiting for {seconds:.1f} seconds...")
-            time.sleep(seconds)
-
-        elif action == "verify":
-            strict = bool(step.get("strict", False))
-            print(f"[Robot Vision] Verifying visibility of '{target}'...")
-            coords = locate_and_segment(target)
-            if coords:
-                print(f"[Robot Vision] Verified '{target}' at X:{coords[0]}, Y:{coords[1]}.")
-            else:
-                print(f"[Robot Vision Warning] Could not verify '{target}'.")
-                if strict:
-                    print("[Robot Execution] Strict verify failed. Aborting sequence.")
-                    break
             
         else:
             print(f"[Error] Unknown action type: {action}")
             
         time.sleep(1) # Pause between steps
-
-    if held_object:
-        print(f"[Robot Notice] Sequence ended while holding '{held_object}'.")
 
 def main():
     print("=== Robot Task Orchestrator Initialized ===")
