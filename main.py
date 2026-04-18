@@ -11,67 +11,27 @@ load_dotenv()
 def get_voice_command():
     """
     Uses the system microphone to capture a voice command and translates it to text.
-    Includes retries, confirmation, and text fallback.
     """
     recognizer = sr.Recognizer()
-
-    # Tuned thresholds make speech capture less sensitive to background noise.
-    recognizer.dynamic_energy_threshold = True
-    recognizer.pause_threshold = 0.8
-    recognizer.non_speaking_duration = 0.4
-
-    max_attempts = 3
-    record_seconds = 6
-
-    for attempt in range(1, max_attempts + 1):
-        with sr.Microphone() as source:
-            print("\n[Microphone] Adjusting for ambient noise... Please wait.")
-            recognizer.adjust_for_ambient_noise(source, duration=0.8)
-            print(f"\n[Microphone] Attempt {attempt}/{max_attempts}")
-            print(f"[Microphone] Recording for {record_seconds} seconds... Speak now!")
-            try:
-                audio = recognizer.record(source, duration=record_seconds)
-                print("[Microphone] Processing speech...")
-                # Use Google's free Web Speech API (no API key required)
-                text = recognizer.recognize_google(audio).strip()
-
-                if not text:
-                    print("[Microphone] Empty speech result. Please try again.")
-                    continue
-
-                print(f"[Voice Input] You said: '{text}'")
-                confirm = input("Use this command? (y/n): ").strip().lower()
-                if confirm == "y":
-                    return text
-
-                change_len = input("Change recording length? Enter seconds (or press Enter to keep 6): ").strip()
-                if change_len.isdigit() and 2 <= int(change_len) <= 15:
-                    record_seconds = int(change_len)
-
-            except sr.UnknownValueError:
-                print("[Microphone] Could not understand audio. Please speak clearly and closer to mic.")
-            except sr.RequestError as e:
-                print(f"[Microphone] Could not request speech results: {e}")
-                break
-            except Exception as e:
-                print(f"[Microphone] Unexpected audio error: {e}")
-
-        if attempt < max_attempts:
-            retry = input("Try voice capture again? (y/n): ").strip().lower()
-            if retry != "y":
-                break
-
-    print("[Microphone] Voice input unsuccessful.")
+    with sr.Microphone() as source:
+        print("\n[Microphone] Adjusting for ambient noise... Please wait.")
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+        print("\n[Microphone] Recording for 5 seconds... Speak now!")
+        try:
+            # Force record for exactly 5 seconds (bypasses silence-detection bugs where it hangs)
+            audio = recognizer.record(source, duration=5)
+            print("[Microphone] Processing speech...")
+            # Use Google's free Web Speech API (no API key required)
+            text = recognizer.recognize_google(audio)
+            print(f"[Voice Input] You said: '{text}'")
+            return text
+        except sr.WaitTimeoutError:
+            print("[Microphone] Error: Listening timed out while waiting for phrase to start.")
+        except sr.UnknownValueError:
+            print("[Microphone] Error: Could not understand audio. Please speak clearly.")
+        except sr.RequestError as e:
+            print(f"[Microphone] Error: Could not request results; {e}")
     return None
-
-
-def get_text_command():
-    """Fallback text input for task description."""
-    task_description = input("Enter the task for the robot (e.g., 'pick the green tape only'): ")
-    if not task_description.strip():
-        print("No task entered. Exiting.")
-        return None
-    return task_description
 
 def get_llm_plan(task_description):
     """
@@ -184,16 +144,12 @@ def main():
     if use_voice_input == 'y':
         task_description = get_voice_command()
         if not task_description:
-            fallback = input("Switch to typing the command instead? (y/n): ").strip().lower()
-            if fallback == "y":
-                task_description = get_text_command()
-                if not task_description:
-                    return
-            else:
-                return
+            return  # Exit if no command was picked up
     else:
-        task_description = get_text_command()
-        if not task_description:
+        # Text input fallback
+        task_description = input("Enter the task for the robot (e.g., 'pick the green tape only'): ")
+        if not task_description.strip():
+            print("No task entered. Exiting.")
             return
     
     # 2. Chain-of-Thought / LLM Planning

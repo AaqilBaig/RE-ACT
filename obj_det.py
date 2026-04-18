@@ -85,8 +85,19 @@ def locate_and_segment(target_class, camera_index=0):
     small_object_keywords = ("key", "coin", "tape", "pen", "screw", "bolt", "nut")
     is_small_object = any(k in target_lower for k in small_object_keywords)
     detection_threshold = 0.18 if is_small_object else 0.14
-    lock_threshold = 0.24 if is_small_object else 0.18
-    min_stable_hits = 0 if is_small_object else 1
+    lock_threshold = 0.28 if is_small_object else 0.22
+    min_stable_hits = 1 if is_small_object else 2
+
+    # Build target-only query variants for better recall on common objects.
+    target_query_phrases = [target_lower]
+    if "phone" in target_lower or "mobile" in target_lower or "cell" in target_lower:
+        target_query_phrases.extend(["phone", "cell phone", "mobile phone", "smartphone"])
+    if "bottle" in target_lower:
+        target_query_phrases.extend(["bottle", "water bottle", "plastic bottle"])
+
+    # Deduplicate while preserving order.
+    seen_queries = set()
+    target_query_phrases = [q for q in target_query_phrases if not (q in seen_queries or seen_queries.add(q))]
 
     def box_iou(a, b):
         ax1, ay1, ax2, ay2 = a
@@ -110,10 +121,11 @@ def locate_and_segment(target_class, camera_index=0):
         nonlocal track_template, track_box, track_last_update, track_miss_count
         try:
             # Keep aspect ratio to avoid shape distortions that can cause false positives
-            infer_w, infer_h = 256, 192
+            infer_w, infer_h = 384, 288
             small_frame = cv2.resize(frame_copy, (infer_w, infer_h))
             image = Image.fromarray(cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB))
-            texts = [[f"a photo of a {target}"]]
+            query_list = [f"a photo of a {q}" for q in target_query_phrases]
+            texts = [query_list]
             inputs = processor(text=texts, images=image, return_tensors="pt").to(device_str)
             if device_id == 0:
                 inputs["pixel_values"] = inputs["pixel_values"].half()
@@ -128,65 +140,79 @@ def locate_and_segment(target_class, camera_index=0):
                 
             target_sizes = torch.tensor([image.size[::-1]]).to(device_str)
             results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=detection_threshold)
+
+            def select_candidate_from_results(result_pack):
+                scores = result_pack["scores"]
+                boxes = result_pack["boxes"]
+                labels = result_pack["labels"]
+                if len(scores) == 0:
+                    return None, 0.0
+
+                frame_h, frame_w = frame_copy.shape[:2]
+                max_area_ratio = 0.22 if is_small_object else 0.80
+                min_area_ratio = 0.0002
+
+                candidate_box = None
+                candidate_conf = 0.0
+                sorted_idxs = torch.argsort(scores, descending=True)
+
+                for idx_tensor in sorted_idxs:
+                    idx = idx_tensor.item()
+                    label_idx = int(labels[idx].item())
+                    conf = scores[idx].item()
+
+                    if label_idx < 0 or label_idx >= len(target_query_phrases):
+                        continue
+
+                    raw_box = boxes[idx].cpu().numpy().tolist()
+
+                    scale_x = frame_w / infer_w
+                    scale_y = frame_h / infer_h
+                    box = [raw_box[0] * scale_x, raw_box[1] * scale_y, raw_box[2] * scale_x, raw_box[3] * scale_y]
+
+                    bw = max(1.0, box[2] - box[0])
+                    bh = max(1.0, box[3] - box[1])
+                    area_ratio = (bw * bh) / float(frame_w * frame_h)
+                    if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                        continue
+
+                    candidate_box = box
+                    candidate_conf = conf
+                    break
+
+                if candidate_box is None:
+                    return None, 0.0
+
+                return candidate_box, candidate_conf
             
             if results and len(results) > 0:
-                scores = results[0]["scores"]
-                boxes = results[0]["boxes"]
-                
-                if len(scores) > 0:
+                candidate_box, candidate_conf = select_candidate_from_results(results[0])
+
+                if candidate_box is not None:
                     frame_h, frame_w = frame_copy.shape[:2]
-                    max_area_ratio = 0.22 if is_small_object else 0.80
-                    min_area_ratio = 0.0002
-
-                    candidate_box = None
-                    candidate_conf = 0.0
-                    sorted_idxs = torch.argsort(scores, descending=True)
-
-                    for idx_tensor in sorted_idxs:
-                        idx = idx_tensor.item()
-                        conf = scores[idx].item()
-                        raw_box = boxes[idx].cpu().numpy().tolist()
-
-                        scale_x = frame_w / infer_w
-                        scale_y = frame_h / infer_h
-                        box = [raw_box[0] * scale_x, raw_box[1] * scale_y, raw_box[2] * scale_x, raw_box[3] * scale_y]
-
-                        bw = max(1.0, box[2] - box[0])
-                        bh = max(1.0, box[3] - box[1])
-                        area_ratio = (bw * bh) / float(frame_w * frame_h)
-
-                        # Filter out implausibly large/small regions for the target object type.
-                        if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
-                            continue
-
-                        candidate_box = box
-                        candidate_conf = conf
-                        break
-
-                    if candidate_box is not None:
-                        if best_box_tmp is not None and box_iou(best_box_tmp, candidate_box) > 0.30:
-                            stable_hits = min(stable_hits + 1, 3)
-                        else:
-                            stable_hits = 0
-
-                        best_box_tmp = candidate_box
-                        best_conf = candidate_conf
-                        best_match = True
-                        track_box = candidate_box.copy()
-                        cx1, cy1, cx2, cy2 = [int(v) for v in candidate_box]
-                        cx1 = max(0, min(cx1, frame_w - 1))
-                        cy1 = max(0, min(cy1, frame_h - 1))
-                        cx2 = max(cx1 + 1, min(cx2, frame_w))
-                        cy2 = max(cy1 + 1, min(cy2, frame_h))
-                        gray_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
-                        roi = gray_full[cy1:cy2, cx1:cx2]
-                        if roi.size > 0:
-                            track_template = roi.copy()
-                            track_last_update = frame_count
-                            track_miss_count = 0
+                    if best_box_tmp is not None and box_iou(best_box_tmp, candidate_box) > 0.30:
+                        stable_hits = min(stable_hits + 1, 3)
                     else:
-                        if track_template is None:
-                            best_match = False
+                        stable_hits = 0
+
+                    best_box_tmp = candidate_box
+                    best_conf = candidate_conf
+                    best_match = True
+                    track_box = candidate_box.copy()
+                    cx1, cy1, cx2, cy2 = [int(v) for v in candidate_box]
+                    cx1 = max(0, min(cx1, frame_w - 1))
+                    cy1 = max(0, min(cy1, frame_h - 1))
+                    cx2 = max(cx1 + 1, min(cx2, frame_w))
+                    cy2 = max(cy1 + 1, min(cy2, frame_h))
+                    gray_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
+                    roi = gray_full[cy1:cy2, cx1:cx2]
+                    if roi.size > 0:
+                        track_template = roi.copy()
+                        track_last_update = frame_count
+                        track_miss_count = 0
+                else:
+                    if track_template is None:
+                        best_match = False
         except Exception as e:
             print(f"Vision Inference Error: {e}")
         finally:
