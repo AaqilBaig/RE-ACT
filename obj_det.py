@@ -75,6 +75,8 @@ def locate_and_segment(target_class, camera_index=0):
     best_conf = 0.0
     best_match = False
     stable_hits = 0
+    detector_last_box = None
+    detector_last_seen_frame = -9999
     # Track motion between inference updates so box follows moving objects smoothly.
     track_template = None
     track_box = None
@@ -86,7 +88,13 @@ def locate_and_segment(target_class, camera_index=0):
     is_small_object = any(k in target_lower for k in small_object_keywords)
     detection_threshold = 0.18 if is_small_object else 0.14
     lock_threshold = 0.28 if is_small_object else 0.22
-    min_stable_hits = 1 if is_small_object else 2
+    min_stable_hits = 2 if is_small_object else 2
+
+    # Tape often triggers background false positives; use stricter confidence and stability.
+    if "tape" in target_lower:
+        detection_threshold = 0.24
+        lock_threshold = 0.36
+        min_stable_hits = 3
 
     # Build target-only query variants for better recall on common objects.
     target_query_phrases = [target_lower]
@@ -119,6 +127,7 @@ def locate_and_segment(target_class, camera_index=0):
     def run_inference(frame_copy, target):
         nonlocal best_box_tmp, best_conf, best_match, stable_hits
         nonlocal track_template, track_box, track_last_update, track_miss_count
+        nonlocal detector_last_box, detector_last_seen_frame
         try:
             # Keep aspect ratio to avoid shape distortions that can cause false positives
             infer_w, infer_h = 384, 288
@@ -190,11 +199,13 @@ def locate_and_segment(target_class, camera_index=0):
 
                 if candidate_box is not None:
                     frame_h, frame_w = frame_copy.shape[:2]
-                    if best_box_tmp is not None and box_iou(best_box_tmp, candidate_box) > 0.30:
+                    if detector_last_box is not None and box_iou(detector_last_box, candidate_box) > 0.35:
                         stable_hits = min(stable_hits + 1, 3)
                     else:
-                        stable_hits = 0
+                        stable_hits = 1
 
+                    detector_last_box = candidate_box.copy()
+                    detector_last_seen_frame = frame_count
                     best_box_tmp = candidate_box
                     best_conf = candidate_conf
                     best_match = True
@@ -292,6 +303,12 @@ def locate_and_segment(target_class, camera_index=0):
                         track_box = None
                         best_match = False
 
+        # Prevent locking from stale tracker drift if detector has not confirmed recently.
+        if frame_count - detector_last_seen_frame > 8:
+            stable_hits = 0
+            if best_conf < lock_threshold:
+                best_match = False
+
         # Draw the bounding box for live view using the most recently known detection
         if best_match and best_box_tmp is not None:
             cv2.rectangle(annotated_frame, 
@@ -317,7 +334,8 @@ def locate_and_segment(target_class, camera_index=0):
                 print(f"[Vision Debug] Frame {frame_count}: Model sees '{target_class}' with confidence ({best_conf:.2f}).")
             
             # Lock in if confidence exceeds threshold (can increase this for YOLO)
-            if best_conf > lock_threshold and stable_hits >= min_stable_hits:
+            detector_is_recent = (frame_count - detector_last_seen_frame) <= 8
+            if best_conf > lock_threshold and stable_hits >= min_stable_hits and detector_is_recent:
                 print(f"[Vision Debug] Detection locked! Confidence: {best_conf:.2f}")
                 # Lock in this frame for SAM
                 final_frame = frame.copy()
