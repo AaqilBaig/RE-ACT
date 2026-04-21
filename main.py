@@ -16,10 +16,9 @@ def get_voice_command():
     with sr.Microphone() as source:
         print("\n[Microphone] Adjusting for ambient noise... Please wait.")
         recognizer.adjust_for_ambient_noise(source, duration=1)
-        print("\n[Microphone] Recording for 5 seconds... Speak now!")
+        print("\n[Microphone] Listening... Speak now!")
         try:
-            # Force record for exactly 5 seconds (bypasses silence-detection bugs where it hangs)
-            audio = recognizer.record(source, duration=5)
+            audio = recognizer.listen(source, timeout=3, phrase_time_limit=6)
             print("[Microphone] Processing speech...")
             # Use Google's free Web Speech API (no API key required)
             text = recognizer.recognize_google(audio)

@@ -31,6 +31,20 @@ print(f"[Initialization] Models loaded successfully.")
 # Global camera instance to prevent startup latency on every grasp
 _global_cap = None
 _current_camera_index = None
+_detection_profile = "balanced"
+
+
+def set_detection_profile(profile_name):
+    """Set detector profile to one of: fast, balanced, precise."""
+    global _detection_profile
+    normalized = str(profile_name).strip().lower()
+    if normalized not in {"fast", "balanced", "precise"}:
+        normalized = "balanced"
+    _detection_profile = normalized
+
+
+def get_detection_profile():
+    return _detection_profile
 
 def get_camera(camera_index):
     global _global_cap, _current_camera_index
@@ -82,19 +96,58 @@ def locate_and_segment(target_class, camera_index=0):
     track_box = None
     track_last_update = 0
     track_miss_count = 0
+    infer_w, infer_h = (384, 288) if device_id == 0 else (320, 240)
 
     target_lower = target_class.lower()
     small_object_keywords = ("key", "coin", "tape", "pen", "screw", "bolt", "nut")
     is_small_object = any(k in target_lower for k in small_object_keywords)
-    detection_threshold = 0.18 if is_small_object else 0.14
-    lock_threshold = 0.28 if is_small_object else 0.22
-    min_stable_hits = 2 if is_small_object else 2
+
+    profile = _detection_profile
+    if profile == "fast":
+        detection_threshold = 0.20 if is_small_object else 0.14
+        lock_threshold = 0.33 if is_small_object else 0.24
+        min_stable_hits = 2
+        detector_interval = 1 if device_id == 0 else 1
+        relax_every_frames = 30
+        relax_step = 0.03
+        near_lock_margin = 0.08
+    elif profile == "precise":
+        detection_threshold = 0.26 if is_small_object else 0.20
+        lock_threshold = 0.42 if is_small_object else 0.34
+        min_stable_hits = 4
+        detector_interval = 2 if device_id == 0 else 3
+        relax_every_frames = 90
+        relax_step = 0.01
+        near_lock_margin = 0.04
+    else:
+        detection_threshold = 0.24 if is_small_object else 0.18
+        lock_threshold = 0.38 if is_small_object else 0.30
+        min_stable_hits = 3
+        detector_interval = 1 if device_id == 0 else 2
+        relax_every_frames = 60
+        relax_step = 0.02
+        near_lock_margin = 0.06
 
     # Tape often triggers background false positives; use stricter confidence and stability.
     if "tape" in target_lower:
-        detection_threshold = 0.24
-        lock_threshold = 0.36
-        min_stable_hits = 3
+        if profile == "fast":
+            detection_threshold = 0.24
+            lock_threshold = 0.36
+            min_stable_hits = 2
+        elif profile == "precise":
+            detection_threshold = 0.30
+            lock_threshold = 0.46
+            min_stable_hits = 4
+        else:
+            detection_threshold = 0.28
+            lock_threshold = 0.42
+            min_stable_hits = 3
+
+    # Adaptively relax lock confidence for long searches to avoid near-lock starvation.
+    adaptive_lock_threshold = lock_threshold
+    min_lock_threshold = max(detection_threshold + 0.05, lock_threshold - 0.12)
+    detector_recent_window = max(10, detector_interval * 5)
+    max_stable_hits = max(3, min_stable_hits + 1)
 
     # Build target-only query variants for better recall on common objects.
     target_query_phrases = [target_lower]
@@ -130,7 +183,6 @@ def locate_and_segment(target_class, camera_index=0):
         nonlocal detector_last_box, detector_last_seen_frame
         try:
             # Keep aspect ratio to avoid shape distortions that can cause false positives
-            infer_w, infer_h = 384, 288
             small_frame = cv2.resize(frame_copy, (infer_w, infer_h))
             image = Image.fromarray(cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB))
             query_list = [f"a photo of a {q}" for q in target_query_phrases]
@@ -200,7 +252,7 @@ def locate_and_segment(target_class, camera_index=0):
                 if candidate_box is not None:
                     frame_h, frame_w = frame_copy.shape[:2]
                     if detector_last_box is not None and box_iou(detector_last_box, candidate_box) > 0.35:
-                        stable_hits = min(stable_hits + 1, 3)
+                        stable_hits = min(stable_hits + 1, max_stable_hits)
                     else:
                         stable_hits = 1
 
@@ -239,8 +291,17 @@ def locate_and_segment(target_class, camera_index=0):
         frame_count += 1
         annotated_frame = frame.copy()
 
-        # Run OWL-v2 instance asynchronously to completely avoid main-thread blocking and camera drops
-        if not inference_running[0]:
+        if frame_count % relax_every_frames == 0 and best_box is None:
+            adaptive_lock_threshold = max(min_lock_threshold, adaptive_lock_threshold - relax_step)
+
+        # Run OWL-v2 asynchronously on a cadence; tracker handles in-between frames.
+        should_refresh_detector = (
+            (frame_count % detector_interval == 0)
+            or not best_match
+            or (best_conf >= (adaptive_lock_threshold - near_lock_margin))
+            or (frame_count - detector_last_seen_frame > detector_interval * 2)
+        )
+        if not inference_running[0] and should_refresh_detector:
             inference_running[0] = True
             threading.Thread(target=run_inference, args=(frame.copy(), target_class), daemon=True).start()
 
@@ -304,9 +365,9 @@ def locate_and_segment(target_class, camera_index=0):
                         best_match = False
 
         # Prevent locking from stale tracker drift if detector has not confirmed recently.
-        if frame_count - detector_last_seen_frame > 8:
-            stable_hits = 0
-            if best_conf < lock_threshold:
+        if frame_count - detector_last_seen_frame > detector_recent_window:
+            stable_hits = max(0, stable_hits - 1)
+            if best_conf < adaptive_lock_threshold:
                 best_match = False
 
         # Draw the bounding box for live view using the most recently known detection
@@ -334,8 +395,8 @@ def locate_and_segment(target_class, camera_index=0):
                 print(f"[Vision Debug] Frame {frame_count}: Model sees '{target_class}' with confidence ({best_conf:.2f}).")
             
             # Lock in if confidence exceeds threshold (can increase this for YOLO)
-            detector_is_recent = (frame_count - detector_last_seen_frame) <= 8
-            if best_conf > lock_threshold and stable_hits >= min_stable_hits and detector_is_recent:
+            detector_is_recent = (frame_count - detector_last_seen_frame) <= detector_recent_window
+            if best_conf > adaptive_lock_threshold and stable_hits >= min_stable_hits and detector_is_recent:
                 print(f"[Vision Debug] Detection locked! Confidence: {best_conf:.2f}")
                 # Lock in this frame for SAM
                 final_frame = frame.copy()
@@ -347,7 +408,7 @@ def locate_and_segment(target_class, camera_index=0):
                 break
             else:
                 if frame_count % 10 == 0:
-                    print(f"[Vision Debug] Phantom object detected but confidence ({best_conf:.2f}) is too low to trigger lock...")
+                    print(f"[Vision Debug] Phantom object detected but confidence ({best_conf:.2f}) is too low to trigger lock (threshold: {adaptive_lock_threshold:.2f})...")
 
     # We do NOT release the camera here so it stays open for the next call.
     # cap.release() 
