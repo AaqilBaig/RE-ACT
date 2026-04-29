@@ -127,7 +127,7 @@ def locate_and_segment(target_class, camera_index=0):
                     outputs = detector(**inputs)
                 
             target_sizes = torch.tensor([image.size[::-1]]).to(device_str)
-            results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=detection_threshold)
+            results = processor.image_processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=detection_threshold)
             
             if results and len(results) > 0:
                 scores = results[0]["scores"]
