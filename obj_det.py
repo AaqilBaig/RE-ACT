@@ -31,6 +31,20 @@ print(f"[Initialization] Models loaded successfully.")
 # Global camera instance to prevent startup latency on every grasp
 _global_cap = None
 _current_camera_index = None
+_detection_profile = "balanced"
+
+
+def set_detection_profile(profile_name):
+    """Set detector profile to one of: fast, balanced, precise."""
+    global _detection_profile
+    normalized = str(profile_name).strip().lower()
+    if normalized not in {"fast", "balanced", "precise"}:
+        normalized = "balanced"
+    _detection_profile = normalized
+
+
+def get_detection_profile():
+    return _detection_profile
 
 def get_camera(camera_index):
     global _global_cap, _current_camera_index
@@ -75,18 +89,76 @@ def locate_and_segment(target_class, camera_index=0):
     best_conf = 0.0
     best_match = False
     stable_hits = 0
+    detector_last_box = None
+    detector_last_seen_frame = -9999
     # Track motion between inference updates so box follows moving objects smoothly.
     track_template = None
     track_box = None
     track_last_update = 0
     track_miss_count = 0
+    infer_w, infer_h = (384, 288) if device_id == 0 else (320, 240)
 
     target_lower = target_class.lower()
     small_object_keywords = ("key", "coin", "tape", "pen", "screw", "bolt", "nut")
     is_small_object = any(k in target_lower for k in small_object_keywords)
-    detection_threshold = 0.18 if is_small_object else 0.14
-    lock_threshold = 0.24 if is_small_object else 0.18
-    min_stable_hits = 0 if is_small_object else 1
+
+    profile = _detection_profile
+    if profile == "fast":
+        detection_threshold = 0.20 if is_small_object else 0.14
+        lock_threshold = 0.33 if is_small_object else 0.24
+        min_stable_hits = 2
+        detector_interval = 1 if device_id == 0 else 1
+        relax_every_frames = 30
+        relax_step = 0.03
+        near_lock_margin = 0.08
+    elif profile == "precise":
+        detection_threshold = 0.26 if is_small_object else 0.20
+        lock_threshold = 0.42 if is_small_object else 0.34
+        min_stable_hits = 4
+        detector_interval = 2 if device_id == 0 else 3
+        relax_every_frames = 90
+        relax_step = 0.01
+        near_lock_margin = 0.04
+    else:
+        detection_threshold = 0.24 if is_small_object else 0.18
+        lock_threshold = 0.38 if is_small_object else 0.30
+        min_stable_hits = 3
+        detector_interval = 1 if device_id == 0 else 2
+        relax_every_frames = 60
+        relax_step = 0.02
+        near_lock_margin = 0.06
+
+    # Tape often triggers background false positives; use stricter confidence and stability.
+    if "tape" in target_lower:
+        if profile == "fast":
+            detection_threshold = 0.24
+            lock_threshold = 0.36
+            min_stable_hits = 2
+        elif profile == "precise":
+            detection_threshold = 0.30
+            lock_threshold = 0.46
+            min_stable_hits = 4
+        else:
+            detection_threshold = 0.28
+            lock_threshold = 0.42
+            min_stable_hits = 3
+
+    # Adaptively relax lock confidence for long searches to avoid near-lock starvation.
+    adaptive_lock_threshold = lock_threshold
+    min_lock_threshold = max(detection_threshold + 0.05, lock_threshold - 0.12)
+    detector_recent_window = max(90, detector_interval * 30) if device_id == -1 else max(45, detector_interval * 15)
+    max_stable_hits = max(3, min_stable_hits + 1)
+
+    # Build target-only query variants for better recall on common objects.
+    target_query_phrases = [target_lower]
+    if "phone" in target_lower or "mobile" in target_lower or "cell" in target_lower:
+        target_query_phrases.extend(["phone", "cell phone", "mobile phone", "smartphone"])
+    if "bottle" in target_lower:
+        target_query_phrases.extend(["bottle", "water bottle", "plastic bottle"])
+
+    # Deduplicate while preserving order.
+    seen_queries = set()
+    target_query_phrases = [q for q in target_query_phrases if not (q in seen_queries or seen_queries.add(q))]
 
     def box_iou(a, b):
         ax1, ay1, ax2, ay2 = a
@@ -108,12 +180,13 @@ def locate_and_segment(target_class, camera_index=0):
     def run_inference(frame_copy, target):
         nonlocal best_box_tmp, best_conf, best_match, stable_hits
         nonlocal track_template, track_box, track_last_update, track_miss_count
+        nonlocal detector_last_box, detector_last_seen_frame
         try:
             # Keep aspect ratio to avoid shape distortions that can cause false positives
-            infer_w, infer_h = 256, 192
             small_frame = cv2.resize(frame_copy, (infer_w, infer_h))
             image = Image.fromarray(cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB))
-            texts = [[f"a photo of a {target}"]]
+            query_list = [f"a photo of a {q}" for q in target_query_phrases]
+            texts = [query_list]
             inputs = processor(text=texts, images=image, return_tensors="pt").to(device_str)
             if device_id == 0:
                 inputs["pixel_values"] = inputs["pixel_values"].half()
@@ -129,8 +202,12 @@ def locate_and_segment(target_class, camera_index=0):
             target_sizes = torch.tensor([image.size[::-1]]).to(device_str)
             results = processor.image_processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=detection_threshold)
             
+            candidate_box = None
+            candidate_conf = 0.0
+            
             if results and len(results) > 0:
                 scores = results[0]["scores"]
+                labels = results[0]["labels"]
                 boxes = results[0]["boxes"]
                 
                 if len(scores) > 0:
@@ -138,13 +215,16 @@ def locate_and_segment(target_class, camera_index=0):
                     max_area_ratio = 0.22 if is_small_object else 0.80
                     min_area_ratio = 0.0002
 
-                    candidate_box = None
-                    candidate_conf = 0.0
                     sorted_idxs = torch.argsort(scores, descending=True)
 
                     for idx_tensor in sorted_idxs:
                         idx = idx_tensor.item()
+                        label_idx = int(labels[idx].item())
                         conf = scores[idx].item()
+
+                        if label_idx < 0 or label_idx >= len(target_query_phrases):
+                            continue
+
                         raw_box = boxes[idx].cpu().numpy().tolist()
 
                         scale_x = frame_w / infer_w
@@ -154,8 +234,6 @@ def locate_and_segment(target_class, camera_index=0):
                         bw = max(1.0, box[2] - box[0])
                         bh = max(1.0, box[3] - box[1])
                         area_ratio = (bw * bh) / float(frame_w * frame_h)
-
-                        # Filter out implausibly large/small regions for the target object type.
                         if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
                             continue
 
@@ -163,30 +241,33 @@ def locate_and_segment(target_class, camera_index=0):
                         candidate_conf = conf
                         break
 
-                    if candidate_box is not None:
-                        if best_box_tmp is not None and box_iou(best_box_tmp, candidate_box) > 0.30:
-                            stable_hits = min(stable_hits + 1, 3)
-                        else:
-                            stable_hits = 0
+            if candidate_box is not None:
+                frame_h, frame_w = frame_copy.shape[:2]
+                if detector_last_box is not None and box_iou(detector_last_box, candidate_box) > 0.35:
+                    stable_hits = min(stable_hits + 1, max_stable_hits)
+                else:
+                    stable_hits = 1
 
-                        best_box_tmp = candidate_box
-                        best_conf = candidate_conf
-                        best_match = True
-                        track_box = candidate_box.copy()
-                        cx1, cy1, cx2, cy2 = [int(v) for v in candidate_box]
-                        cx1 = max(0, min(cx1, frame_w - 1))
-                        cy1 = max(0, min(cy1, frame_h - 1))
-                        cx2 = max(cx1 + 1, min(cx2, frame_w))
-                        cy2 = max(cy1 + 1, min(cy2, frame_h))
-                        gray_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
-                        roi = gray_full[cy1:cy2, cx1:cx2]
-                        if roi.size > 0:
-                            track_template = roi.copy()
-                            track_last_update = frame_count
-                            track_miss_count = 0
-                    else:
-                        if track_template is None:
-                            best_match = False
+                detector_last_box = candidate_box.copy()
+                detector_last_seen_frame = frame_count
+                best_box_tmp = candidate_box
+                best_conf = candidate_conf
+                best_match = True
+                track_box = candidate_box.copy()
+                cx1, cy1, cx2, cy2 = [int(v) for v in candidate_box]
+                cx1 = max(0, min(cx1, frame_w - 1))
+                cy1 = max(0, min(cy1, frame_h - 1))
+                cx2 = max(cx1 + 1, min(cx2, frame_w))
+                cy2 = max(cy1 + 1, min(cy2, frame_h))
+                gray_full = cv2.cvtColor(frame_copy, cv2.COLOR_BGR2GRAY)
+                roi = gray_full[cy1:cy2, cx1:cx2]
+                if roi.size > 0:
+                    track_template = roi.copy()
+                    track_last_update = frame_count
+                    track_miss_count = 0
+            else:
+                if track_template is None:
+                    best_match = False
         except Exception as e:
             print(f"Vision Inference Error: {e}")
         finally:
@@ -202,8 +283,17 @@ def locate_and_segment(target_class, camera_index=0):
         frame_count += 1
         annotated_frame = frame.copy()
 
-        # Run OWL-v2 instance asynchronously to completely avoid main-thread blocking and camera drops
-        if not inference_running[0]:
+        if frame_count % relax_every_frames == 0 and best_box is None:
+            adaptive_lock_threshold = max(min_lock_threshold, adaptive_lock_threshold - relax_step)
+
+        # Run OWL-v2 asynchronously on a cadence; tracker handles in-between frames.
+        should_refresh_detector = (
+            (frame_count % detector_interval == 0)
+            or not best_match
+            or (best_conf >= (adaptive_lock_threshold - near_lock_margin))
+            or (frame_count - detector_last_seen_frame > detector_interval * 2)
+        )
+        if not inference_running[0] and should_refresh_detector:
             inference_running[0] = True
             threading.Thread(target=run_inference, args=(frame.copy(), target_class), daemon=True).start()
 
@@ -254,6 +344,12 @@ def locate_and_segment(target_class, camera_index=0):
                     best_match = True
                     track_miss_count = 0
 
+                    # Motion tracker confirmation also counts toward stable hits
+                    if best_conf >= (adaptive_lock_threshold - 0.10):
+                        stable_hits = min(stable_hits + 1, max_stable_hits)
+                    else:
+                        stable_hits = max(1, stable_hits) # Maintain at least 1 hit from active tracker
+
                     # Refresh template occasionally for robustness against lighting/pose change.
                     if frame_count % 8 == 0:
                         new_roi = gray[ny1:ny2, nx1:nx2]
@@ -265,6 +361,15 @@ def locate_and_segment(target_class, camera_index=0):
                         track_template = None
                         track_box = None
                         best_match = False
+
+        # Prevent locking from stale tracker drift if detector has not confirmed recently.
+        if frame_count - detector_last_seen_frame > detector_recent_window:
+            # Only decay if tracker has also failed recently
+            if track_miss_count > 5:
+                if frame_count % 10 == 0:
+                    stable_hits = max(0, stable_hits - 1)
+            if best_conf < adaptive_lock_threshold:
+                best_match = False
 
         # Draw the bounding box for live view using the most recently known detection
         if best_match and best_box_tmp is not None:
@@ -291,7 +396,8 @@ def locate_and_segment(target_class, camera_index=0):
                 print(f"[Vision Debug] Frame {frame_count}: Model sees '{target_class}' with confidence ({best_conf:.2f}).")
             
             # Lock in if confidence exceeds threshold (can increase this for YOLO)
-            if best_conf > lock_threshold and stable_hits >= min_stable_hits:
+            detector_is_recent = (frame_count - detector_last_seen_frame) <= detector_recent_window
+            if best_conf > adaptive_lock_threshold and stable_hits >= min_stable_hits and detector_is_recent:
                 print(f"[Vision Debug] Detection locked! Confidence: {best_conf:.2f}")
                 # Lock in this frame for SAM
                 final_frame = frame.copy()
@@ -303,10 +409,14 @@ def locate_and_segment(target_class, camera_index=0):
                 break
             else:
                 if frame_count % 10 == 0:
-                    print(f"[Vision Debug] Phantom object detected but confidence ({best_conf:.2f}) is too low to trigger lock...")
-
-    # We do NOT release the camera here so it stays open for the next call.
-    # cap.release() 
+                    if best_conf <= adaptive_lock_threshold:
+                        print(f"[Vision Debug] Confidence ({best_conf:.2f}) is too low to trigger lock (threshold: {adaptive_lock_threshold:.2f})")
+                    elif stable_hits < min_stable_hits:
+                        print(f"[Vision Debug] Waiting for stable hits... ({stable_hits}/{min_stable_hits})")
+                    elif not detector_is_recent:
+                        print(f"[Vision Debug] Detection is not recent enough. Waiting for detector refresh.")
+                # We do NOT release the camera here so it stays open for the next call.
+                # cap.release() 
 
     if not best_box:
         print(f"'{target_class}' not found or aborted.")

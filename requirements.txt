@@ -7,6 +7,8 @@ python-dotenv
 requests
 torch
 torchvision
+pyvision
+streamlit
 SpeechRecognition
 pyserial
 pyvoice
